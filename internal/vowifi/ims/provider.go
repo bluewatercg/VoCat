@@ -38,6 +38,7 @@ type Config struct {
 	PCSCF               string
 	LocalAddress        string
 	Transport           string
+	TransportByPLMN     map[string]string
 	Port                int
 	RegistrationExpiry  time.Duration
 	TransactionTimeout  time.Duration
@@ -106,6 +107,19 @@ func normalizeConfig(config Config) (Config, error) {
 	if config.Transport != "" && config.Transport != "udp" && config.Transport != "tcp" {
 		return Config{}, fmt.Errorf("ims: unsupported SIP transport %q", config.Transport)
 	}
+	transportByPLMN := make(map[string]string, len(config.TransportByPLMN))
+	for plmn, transport := range config.TransportByPLMN {
+		plmn = strings.TrimSpace(plmn)
+		transport = strings.ToLower(strings.TrimSpace(transport))
+		if !digitsBetween(plmn, 5, 6) {
+			return Config{}, fmt.Errorf("ims: invalid transport override PLMN %q", plmn)
+		}
+		if transport != "udp" && transport != "tcp" {
+			return Config{}, fmt.Errorf("ims: unsupported SIP transport %q for PLMN %s", transport, plmn)
+		}
+		transportByPLMN[plmn] = transport
+	}
+	config.TransportByPLMN = transportByPLMN
 	if strings.TrimSpace(config.UserAgent) == "" {
 		config.UserAgent = "vocat/1"
 	}
@@ -185,7 +199,7 @@ func (provider *Provider) Start(ctx context.Context, request vowifi.IMSRequest) 
 	if provider.config.PCSCF != "" && !pcscfProvenByTunnel(endpoint, tunnel.PCSCF, provider.config.Port) {
 		return nil, errors.New("ims: configured P-CSCF is not proven by the SWu tunnel")
 	}
-	transport := provider.config.Transport
+	transport := transportForIdentity(provider.config, request.Identity)
 	if transport == "" {
 		transport = transportHint
 	}
@@ -227,6 +241,15 @@ func (provider *Provider) Start(ctx context.Context, request vowifi.IMSRequest) 
 	return session, nil
 }
 
+func transportForIdentity(config Config, identity vowifi.SIMIdentity) string {
+	mcc := strings.TrimSpace(identity.HomeMCC)
+	mnc := strings.TrimSpace(identity.HomeMNC)
+	if transport := config.TransportByPLMN[mcc+mnc]; transport != "" {
+		return transport
+	}
+	return config.Transport
+}
+
 type identitySet struct {
 	domain  string
 	private string
@@ -248,13 +271,22 @@ func deriveIdentities(identity vowifi.SIMIdentity, config Config) (identitySet, 
 		mnc = "0" + mnc
 	}
 	domain := fmt.Sprintf("ims.mnc%s.mcc%s.3gppnetwork.org", mnc, mcc)
+	privateDomain := domain
+	publicDomain := domain
+	if vowifi.IsATT310280(identity) {
+		// AT&T provisions the IMPI and IMPU in its ISIM domains rather than
+		// the generic 3GPP PLMN IMS domain.
+		domain = "one.att.net"
+		privateDomain = "private.att.net"
+		publicDomain = "one.att.net"
+	}
 	privateIdentity := config.PrivateIdentity
 	if privateIdentity == "" {
-		privateIdentity = imsi + "@" + domain
+		privateIdentity = imsi + "@" + privateDomain
 	}
 	publicIdentity := config.PublicIdentity
 	if publicIdentity == "" {
-		publicIdentity = "sip:" + imsi + "@" + domain
+		publicIdentity = "sip:" + imsi + "@" + publicDomain
 	}
 	if strings.ContainsAny(privateIdentity+publicIdentity, "\r\n") ||
 		!strings.Contains(privateIdentity, "@") ||
@@ -511,14 +543,32 @@ func newSession(
 			refreshCancel()
 			return nil, errors.New("ims: protected local IP address is unavailable")
 		}
+		protectedClientPort := provider.config.ProtectedClientPort
+		protectedServerPort := provider.config.ProtectedServerPort
+		if vowifi.IsATT310280(request.Identity) && protectedServerPort == 0 {
+			protectedServerPort = 6000
+		}
+		if securityEncryptionForIdentity(request.Identity) == "null" {
+			if protectedClientPort == 0 {
+				protectedClientPort = 5062
+			}
+			if protectedServerPort == 0 {
+				protectedServerPort = 5063
+			}
+		}
 		proposal, err := newSecurityProposal(
 			localIP,
-			provider.config.ProtectedClientPort,
-			provider.config.ProtectedServerPort,
+			protectedClientPort,
+			protectedServerPort,
 		)
 		if err != nil {
 			refreshCancel()
 			return nil, err
+		}
+		proposal.encryption = securityEncryptionForIdentity(request.Identity)
+		if vowifi.IsATT310280(request.Identity) {
+			proposal.integrityAlgorithms = []string{"hmac-sha-1-96"}
+			proposal.encryptionAlgorithmsList = []string{"aes-cbc"}
 		}
 		session.securityProposal = proposal
 		protectedTCP, err := net.ListenTCP(
@@ -542,6 +592,21 @@ func newSession(
 		session.protectedUDP = protectedUDP
 	}
 	return session, nil
+}
+
+func securityEncryptionForIdentity(identity vowifi.SIMIdentity) string {
+	if usesO2GermanyIMSProfile(identity) {
+		// O2 Germany's P-CSCF advertises the 3GPP integrity-only ESP profile.
+		// Proposing aes-cbc is rejected before the AKA challenge is issued.
+		return "null"
+	}
+	return "aes-cbc"
+}
+
+func usesO2GermanyIMSProfile(identity vowifi.SIMIdentity) bool {
+	mcc := strings.TrimSpace(identity.HomeMCC)
+	mnc := strings.TrimLeft(strings.TrimSpace(identity.HomeMNC), "0")
+	return mcc+mnc == "2623"
 }
 
 func (session *Session) abort() {
@@ -612,6 +677,15 @@ func registrationRejectionError(response *sipResponse, phase string) error {
 			}
 		}
 	}
+	// P-Debug-Info is carrier-generated but can contain subscriber identifiers.
+	// Surface only a fixed classification for the O2 security-agreement error;
+	// never copy the raw header into logs or API responses.
+	for _, value := range response.values("P-Debug-Info") {
+		if strings.Contains(strings.ToLower(value), "no matched security item") {
+			message += "; carrier detail: no matched IMS security item"
+			break
+		}
+	}
 	return fmt.Errorf("%w: %s", ErrRegistrationRejected, message)
 }
 
@@ -674,7 +748,11 @@ func (session *Session) register(ctx context.Context, expires int) (*sipResponse
 		if err != nil {
 			return nil, err
 		}
-		material, err := authenticateAKA(ctx, session.provider.aka, session.request.Identity, challenge)
+		preference := ""
+		if vowifi.IsATT310280(session.request.Identity) {
+			preference = "isim_strict"
+		}
+		material, err := authenticateAKA(ctx, session.provider.aka, session.request.Identity, challenge, preference)
 		if err != nil {
 			return nil, err
 		}
@@ -734,6 +812,10 @@ func (session *Session) buildRegister(
 	authorizationHeader string,
 	authorization string,
 ) ([]byte, error) {
+	att310280 := vowifi.IsATT310280(session.request.Identity)
+	if att310280 {
+		expires = 18400
+	}
 	branch, err := randomHex(12)
 	if err != nil {
 		return nil, err
@@ -752,6 +834,34 @@ func (session *Session) buildRegister(
 		session.instanceID,
 		"urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel",
 	)
+	if att310280 {
+		contact = fmt.Sprintf(
+			`<sip:%s@%s;transport=%s>;+g.3gpp.accesstype="wlan1";audio;+g.3gpp.smsip;`+
+				`+g.3gpp.icsi-ref="%s";+sip.instance="<%s>"`,
+			session.identity.user,
+			contactAddress,
+			session.transport,
+			"urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel",
+			session.instanceID,
+		)
+	}
+	o2Germany := usesO2GermanyIMSProfile(session.request.Identity)
+	supported := "path, gruu"
+	allow := "REGISTER, INVITE, ACK, CANCEL, BYE, OPTIONS"
+	if o2Germany {
+		// Match the complete IMS capability set used by the previously working
+		// VoHive client. O2 validates more of the initial UE security profile
+		// than the other tested carriers do.
+		supported = "path, gruu, outbound, sec-agree, 100rel, timer"
+		allow = "INVITE, ACK, CANCEL, BYE, PRACK, UPDATE, INFO, MESSAGE, OPTIONS"
+	}
+	if att310280 {
+		supported = "path,sec-agree,gruu"
+	}
+	userAgent := strings.TrimSpace(session.provider.config.UserAgent)
+	if att310280 && (userAgent == "" || userAgent == "vocat/1") {
+		userAgent = "SimAdmin VoWiFi"
+	}
 	lines := []string{
 		"REGISTER " + requestURI + " SIP/2.0",
 		fmt.Sprintf("Via: SIP/2.0/%s %s;branch=z9hG4bK%s;rport", transportUpper, local, branch),
@@ -763,14 +873,25 @@ func (session *Session) buildRegister(
 		fmt.Sprintf("CSeq: %d REGISTER", cseq),
 		"Contact: " + contact,
 		fmt.Sprintf("Expires: %d", expires),
-		"Supported: path, gruu",
-		"Allow: REGISTER, INVITE, ACK, CANCEL, BYE, OPTIONS",
-		"User-Agent: " + session.provider.config.UserAgent,
+		"Supported: " + supported,
+		"Allow: " + allow,
+		"User-Agent: " + userAgent,
+	}
+	if o2Germany {
+		lines = append(lines, "P-Preferred-Identity: <"+session.identity.public+">")
+	} else if att310280 {
+		lines = append(lines,
+			"P-Preferred-Identity: <"+session.identity.public+">",
+			`P-Visited-Network-ID: "one.att.net"`,
+			"P-Access-Network-Info: IEEE-802.11;i-wlan-node-id=000000000000;network-provided",
+			"Cellular-Network-Info: 3GPP-E-UTRAN-FDD;utran-cell-id-3gpp=3102800000000;cell-info-age=0",
+			"Accept-Contact: *;+g.3gpp.smsip",
+			`Accept-Contact: *;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel"`,
+		)
 	}
 	if session.securityOffered() {
-		lines = append(
-			lines,
-			"Security-Client: "+session.securityProposal.headerValue(),
+		lines = append(lines,
+			"Security-Client: "+session.securityClientValue(),
 			"Require: sec-agree",
 			"Proxy-Require: sec-agree",
 		)
@@ -1171,7 +1292,14 @@ func (session *Session) Close(ctx context.Context) error {
 	session.closeInboundConnections()
 	session.receiveDone.Wait()
 	if session.ipsecHandle != nil {
-		if err := session.ipsecHandle.Close(ctx); err != nil {
+		// XFRM teardown is local and must still run when SIP deregistration has
+		// consumed the caller's deadline. Use a fresh bounded context so a
+		// service restart or Profile switch cannot strand the previous SIM's
+		// transport-mode policies in the kernel.
+		cleanupContext, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		err := session.ipsecHandle.Close(cleanupContext)
+		cleanupCancel()
+		if err != nil {
 			cleanupErrors = append(cleanupErrors, err)
 		}
 	}

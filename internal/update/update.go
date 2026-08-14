@@ -15,12 +15,14 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"vocat/internal/buildinfo"
@@ -149,7 +151,7 @@ func applyUpdate(ctx context.Context, logger *slog.Logger, opts Options, release
 	}()
 
 	logger.Info("downloading binary", "asset", asset.Name, "size", asset.Size, "url", asset.BrowserDownloadURL)
-	if err := downloadAsset(ctx, asset.BrowserDownloadURL, opts.Token, tmp); err != nil {
+	if err := downloadAssetWithProgress(ctx, logger, asset, opts.Token, tmp); err != nil {
 		cleanup()
 		return err
 	}
@@ -184,6 +186,10 @@ func applyUpdate(ctx context.Context, logger *slog.Logger, opts Options, release
 		cleanup()
 		return fmt.Errorf("update: chmod temp binary: %w", err)
 	}
+	if err := validateExecutable(ctx, tmpPath); err != nil {
+		cleanup()
+		return err
+	}
 	if err := backupAndReplace(opts.Target, tmpPath); err != nil {
 		cleanup()
 		return err
@@ -202,10 +208,87 @@ func applyUpdate(ctx context.Context, logger *slog.Logger, opts Options, release
 	return nil
 }
 
+type downloadProgressWriter struct {
+	destination io.Writer
+	downloaded  atomic.Int64
+}
+
+func (writer *downloadProgressWriter) Write(data []byte) (int, error) {
+	written, err := writer.destination.Write(data)
+	writer.downloaded.Add(int64(written))
+	return written, err
+}
+
+func downloadAssetWithProgress(
+	ctx context.Context,
+	logger *slog.Logger,
+	asset *Asset,
+	token string,
+	destination io.Writer,
+) error {
+	progress := &downloadProgressWriter{destination: destination}
+	done := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				downloaded := progress.downloaded.Load()
+				percent := float64(0)
+				if asset.Size > 0 {
+					percent = float64(downloaded) * 100 / float64(asset.Size)
+				}
+				logger.Info(
+					"download progress",
+					"asset", asset.Name,
+					"downloaded", downloaded,
+					"total", asset.Size,
+					"percent", fmt.Sprintf("%.1f", percent),
+				)
+			}
+		}
+	}()
+	err := downloadAsset(ctx, asset.BrowserDownloadURL, token, progress)
+	close(done)
+	if err != nil {
+		return err
+	}
+	if asset.Size > 0 && progress.downloaded.Load() != asset.Size {
+		return fmt.Errorf(
+			"update: asset size mismatch for %s: downloaded %d bytes, expected %d",
+			asset.Name,
+			progress.downloaded.Load(),
+			asset.Size,
+		)
+	}
+	logger.Info("download completed", "asset", asset.Name, "bytes", progress.downloaded.Load())
+	return nil
+}
+
+// validateExecutable catches incompatible architectures and missing dynamic
+// loaders before the working installation is touched. A valid checksum alone
+// cannot detect those packaging errors.
+func validateExecutable(ctx context.Context, path string) error {
+	checkCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	output, err := exec.CommandContext(checkCtx, path, "version").CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("update: downloaded binary cannot run on this host: %w (%s)", err, strings.TrimSpace(string(output)))
+	}
+	if !strings.Contains(strings.ToLower(string(output)), "vocat") {
+		return fmt.Errorf("update: downloaded binary returned an unexpected version response: %q", strings.TrimSpace(string(output)))
+	}
+	return nil
+}
+
 // backupAndReplace renames the current binary aside, then moves the verified
-// temp file into place. Both renames are atomic on the same filesystem. On
-// Linux the kernel holds the running binary's inode, so replacing it mid-flight
-// is safe.
+// temp file into place. Both renames are atomic on the same filesystem. The
+// previous working binary is retained for service-level or manual rollback.
 func backupAndReplace(target, tmp string) error {
 	backup := target + ".previous"
 	if _, err := os.Stat(target); err == nil {
@@ -221,16 +304,21 @@ func backupAndReplace(target, tmp string) error {
 		}
 		return fmt.Errorf("update: move new binary into place: %w", err)
 	}
-	_ = os.Remove(backup)
 	return nil
 }
 
-// RestartService restarts the vocat systemd unit. If systemctl is unavailable
-// (non-systemd hosts, containers), it returns an error the caller surfaces as
-// a non-fatal warning.
+// RestartService supports both systemd hosts and OpenWrt/procd routers.
 func RestartService(logger *slog.Logger) error {
+	if _, err := os.Stat("/etc/init.d/vocat"); err == nil {
+		cmd := exec.Command("/etc/init.d/vocat", "restart")
+		if out, err := cmd.CombinedOutput(); err != nil {
+			logger.Warn("OpenWrt service restart failed", "error", err, "output", string(out))
+			return fmt.Errorf("restart OpenWrt vocat service: %w", err)
+		}
+		return nil
+	}
 	if _, err := exec.LookPath("systemctl"); err != nil {
-		return fmt.Errorf("systemctl not found in PATH")
+		return fmt.Errorf("neither /etc/init.d/vocat nor systemctl is available")
 	}
 	// Queue the restart and let systemctl exit before systemd stops this unit.
 	// A blocking restart command becomes part of vocat.service's own cgroup and

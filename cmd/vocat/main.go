@@ -89,6 +89,13 @@ func main() {
 			logger.Error("develop failed", "error", err)
 			os.Exit(2)
 		}
+	case "bootstrap-admin":
+		// Installer-only command. The password is read from stdin so it never
+		// appears in argv, an environment file, or process listings.
+		if err := runBootstrapAdmin(rest); err != nil {
+			logger.Error("bootstrap admin failed", "error", err)
+			os.Exit(1)
+		}
 	case "help", "-h", "--help":
 		printUsage(os.Stdout)
 	default:
@@ -112,12 +119,11 @@ func run(logger *slog.Logger, logs *loghub.Hub) error {
 	if err != nil {
 		return fmt.Errorf("load configuration: %w", err)
 	}
-	if cfg.UsesDefaultCredentials() {
-		logger.Warn(
-			"default admin credentials are active; set VOCAT_ADMIN_PASSWORD before exposing the service",
-		)
+	instanceLock, err := lockServerInstance(cfg.DatabasePath)
+	if err != nil {
+		return err
 	}
-
+	defer instanceLock.Close()
 	startupContext, cancelStartup := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancelStartup()
 
@@ -177,12 +183,11 @@ func run(logger *slog.Logger, logs *loghub.Hub) error {
 	if err != nil {
 		return err
 	}
-	if err := authService.EnsureAdmin(
-		startupContext,
-		cfg.AdminUsername,
-		cfg.AdminPassword,
-	); err != nil {
-		return err
+	if _, adminErr := database.CurrentAdmin(startupContext); adminErr != nil {
+		if errors.Is(adminErr, store.ErrNotFound) {
+			return errors.New("administrator is not initialized; run vocat bootstrap-admin before starting the service")
+		}
+		return fmt.Errorf("read administrator: %w", adminErr)
 	}
 
 	cardReaders := pcsc.New()
@@ -617,12 +622,18 @@ func configureVoWiFiRuntime(
 		}
 		if deviceConfig.VoWiFiEnabled {
 			if entry, mapErr := mapper.Get(deviceConfig.ID); mapErr == nil {
-				flightContext, cancelFlight := context.WithTimeout(ctx, 10*time.Second)
-				_, flightErr := deviceManager.SetFlight(flightContext, entry.ID, true)
-				cancelFlight()
+				flightErr := protectVoWiFiStartupRadio(ctx, deviceManager, entry.ID)
 				if flightErr != nil {
-					_ = manager.Close(context.Background())
-					return nil, fmt.Errorf("protect device %q before VoWiFi startup: %w", deviceConfig.ID, flightErr)
+					// A modem can be temporarily unavailable while OpenWrt/procd is
+					// restarting the service (notably after loading XFRM modules). Do
+					// not take the Web/API service down with it: the orchestrator below
+					// remains fail-closed and its runtime manager retries until CFUN=4
+					// can be established.
+					logger.Warn(
+						"VoWiFi startup radio protection deferred to automatic retry",
+						"device_id", deviceConfig.ID,
+						"error", flightErr,
+					)
 				}
 			}
 			if _, err := manager.RequestEnabled(deviceConfig.ID, true); err != nil {
@@ -632,6 +643,56 @@ func configureVoWiFiRuntime(
 		}
 	}
 	return manager, nil
+}
+
+const (
+	vowifiStartupRadioAttempts = 3
+	vowifiStartupRadioDelay    = time.Second
+)
+
+type flightModeSetter interface {
+	SetFlight(context.Context, string, bool) (device.FlightResult, error)
+}
+
+func protectVoWiFiStartupRadio(ctx context.Context, manager flightModeSetter, physicalID string) error {
+	return protectVoWiFiStartupRadioWithRetry(
+		ctx,
+		manager,
+		physicalID,
+		vowifiStartupRadioAttempts,
+		vowifiStartupRadioDelay,
+	)
+}
+
+func protectVoWiFiStartupRadioWithRetry(
+	ctx context.Context,
+	manager flightModeSetter,
+	physicalID string,
+	attempts int,
+	delay time.Duration,
+) error {
+	var lastErr error
+	for attempt := 0; attempt < attempts; attempt++ {
+		flightContext, cancel := context.WithTimeout(ctx, 10*time.Second)
+		_, lastErr = manager.SetFlight(flightContext, physicalID, true)
+		cancel()
+		if lastErr == nil {
+			return nil
+		}
+		if attempt+1 == attempts {
+			break
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return errors.Join(lastErr, ctx.Err())
+		case <-timer.C:
+		}
+	}
+	return lastErr
 }
 
 type vowifiDeviceAdapter interface {
@@ -654,9 +715,13 @@ func newVoWiFiOrchestrator(
 		return nil, fmt.Errorf("device %q IKE provider: %w", deviceConfig.ID, err)
 	}
 	imsProvider, err := ims.NewProvider(adapter, ims.Config{
-		// The userspace SWu data plane currently carries the protected P-CSCF
-		// signalling path over TCP.
+		// The userspace SWu data plane carries protected P-CSCF signalling over
+		// TCP by default. UK PLMN 234-10 exposes its P-CSCF over UDP/5060 on SWu.
 		Transport: "tcp",
+		TransportByPLMN: map[string]string{
+			"23410":  "udp",
+			"234010": "udp",
+		},
 		// Some Vodafone UK SIM profiles leave AT+CSCA empty; Vodafone publishes
 		// this service-centre number for manual SMS setup.
 		SMSCenter: "+447785016005",
@@ -877,7 +942,7 @@ func pollDeviceSnapshots(
 		var refreshGroup sync.WaitGroup
 		refreshSlots := make(chan struct{}, 4)
 		for _, entry := range entries {
-			if !entry.Discovered {
+			if !entry.Discovered || entry.Candidate.DiscoveryIssue != "" {
 				continue
 			}
 			entry := entry

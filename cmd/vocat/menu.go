@@ -22,9 +22,8 @@ import (
 	"vocat/internal/update"
 )
 
-// envFilePath is the systemd EnvironmentFile that carries VOCAT_ADMIN_PASSWORD.
-// EnsureAdmin reseeds the DB from it on every start, so change-password must
-// rewrite it or the next restart reverts the password.
+// envFilePath carries non-secret service settings such as the Web listen port.
+// Administrator credentials live exclusively in the database.
 const envFilePath = "/etc/vocat/env"
 
 // legacyEnvFilePath was used by the standalone deploy/vocat.service. Keep it
@@ -51,8 +50,8 @@ const uiPreferencesSettingKey = "ui.preferences"
 // rc) and VOCAT_DATABASE_PATH is unset, so config.Load() would resolve a
 // CWD-relative ./data/vocat.db — a different, empty database than
 // /opt/vocat/data/vocat.db the service uses. This loads the installed env file
-// for VOCAT_ADMIN_PASSWORD and pins VOCAT_DATABASE_PATH to the install default,
-// without overriding any value the operator already exported.
+// and pins VOCAT_DATABASE_PATH to the install default, without overriding any
+// value the operator already exported. Legacy credential entries are ignored.
 func loadMenuEnv() {
 	if _, ok := os.LookupEnv("VOCAT_DATABASE_PATH"); !ok {
 		_ = os.Setenv("VOCAT_DATABASE_PATH", defaultDatabasePath)
@@ -68,6 +67,9 @@ func loadMenuEnv() {
 				continue
 			}
 			key := strings.TrimSpace(line[:eq])
+			if key == "VOCAT_ADMIN_USERNAME" || key == "VOCAT_ADMIN_PASSWORD" || key == "VOCAT_ADMIN_PASSWORD_B64" {
+				continue
+			}
 			val := strings.TrimSpace(line[eq+1:])
 			if _, ok := os.LookupEnv(key); !ok {
 				_ = os.Setenv(key, val)
@@ -86,7 +88,7 @@ func menuEnvFilePath() string {
 	return envFilePath
 }
 
-// runMenu is the interactive lifecycle menu: toggle language, change password,
+// runMenu is the interactive lifecycle menu: toggle language, reset credentials,
 // change the Web listener port, restart the systemd unit, self-update, or fully
 // uninstall vocat. It must run as root on the host (needs systemctl + the 0600
 // env file). Docker deployments do not use it.
@@ -126,7 +128,7 @@ func runMenu(logger *slog.Logger) error {
 				fmt.Println(menu.errorPrefix(err))
 			}
 		case "2":
-			if err := menuChangePassword(reader, menu, logger); err != nil {
+			if err := menuResetAdminCredentials(reader, menu); err != nil {
 				fmt.Println(menu.errorPrefix(err))
 			}
 		case "3":
@@ -191,13 +193,12 @@ func loadMenuLanguage() (string, error) {
 	return "en", nil
 }
 
-func menuChangePassword(reader *bufio.Reader, m *menu, logger *slog.Logger) error {
+func menuResetAdminCredentials(reader *bufio.Reader, m *menu) error {
 	cfg, err := config.Load()
 	if err != nil {
 		return fmt.Errorf("%w: %v", errMenuConfig, err)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
+	ctx := context.Background()
 
 	database, err := store.Open(ctx, cfg.DatabasePath)
 	if err != nil {
@@ -209,11 +210,18 @@ func menuChangePassword(reader *bufio.Reader, m *menu, logger *slog.Logger) erro
 	if err != nil {
 		return fmt.Errorf("%w: %v", errMenuAuth, err)
 	}
-
-	fmt.Print(m.currentPassword())
-	currentPw, err := readPasswordMasked()
+	admin, err := database.CurrentAdmin(ctx)
 	if err != nil {
-		return err
+		return fmt.Errorf("%w: %v", errMenuStore, err)
+	}
+	fmt.Print(m.newUsername(admin.Username))
+	username, err := reader.ReadString('\n')
+	if err != nil {
+		return fmt.Errorf("read administrator username: %w", err)
+	}
+	username = strings.TrimSpace(username)
+	if username == "" {
+		username = admin.Username
 	}
 	fmt.Print(m.newPassword())
 	newPw, err := readPasswordMasked()
@@ -229,18 +237,8 @@ func menuChangePassword(reader *bufio.Reader, m *menu, logger *slog.Logger) erro
 	if newPw != confirmPw {
 		return errPasswordsDiffer
 	}
-	if err := authService.ChangePassword(ctx, cfg.AdminUsername, currentPw, newPw); err != nil {
-		if errors.Is(err, auth.ErrInvalidCredentials) {
-			return errCurrentWrong
-		}
+	if err := authService.ResetAdminCredentials(ctx, username, newPw); err != nil {
 		return fmt.Errorf("%w: %v", errMenuAuth, err)
-	}
-	// Persist the new plaintext to the env file so the next EnsureAdmin (on
-	// restart) agrees with the hash we just wrote to the DB. Without this the
-	// restart reverts the password to whatever the env file still holds.
-	if err := rewriteEnvPassword(newPw); err != nil {
-		logger.Error("menu: password changed in DB but env file rewrite failed; restart will revert", "error", err)
-		return fmt.Errorf("%w: %v", errMenuEnvWrite, err)
 	}
 	fmt.Println(m.passwordChanged())
 	return nil
@@ -258,19 +256,14 @@ func readPasswordMasked() (string, error) {
 	return string(bytes), nil
 }
 
-// rewriteEnvPassword replaces (or appends) the VOCAT_ADMIN_PASSWORD line in the
-// systemd EnvironmentFile and keeps the file 0600. The replacement is atomic:
-// the temp file lives in the same directory so os.Rename stays on one
-// filesystem.
-func rewriteEnvPassword(newPassword string) error {
-	return rewriteEnvValue(menuEnvFilePath(), "VOCAT_ADMIN_PASSWORD", newPassword)
-}
-
 // rewriteEnvValue replaces or appends one systemd EnvironmentFile value. The
 // write is atomic and rejects line breaks so one setting cannot inject another.
 func rewriteEnvValue(path, name, value string) error {
 	if name == "" || strings.ContainsAny(name, "=\r\n\x00") || strings.ContainsAny(value, "\r\n\x00") {
 		return errors.New("invalid environment setting")
+	}
+	if strings.HasPrefix(name, "VOCAT_ADMIN_") {
+		return errors.New("administrator credentials cannot be stored in the environment file")
 	}
 	key := name + "="
 	var lines []string
@@ -282,12 +275,17 @@ func rewriteEnvValue(path, name, value string) error {
 
 	replaced := false
 	for i, line := range lines {
+		if strings.HasPrefix(line, "VOCAT_ADMIN_USERNAME=") || strings.HasPrefix(line, "VOCAT_ADMIN_PASSWORD=") || strings.HasPrefix(line, "VOCAT_ADMIN_PASSWORD_B64=") {
+			lines[i] = ""
+			continue
+		}
 		if strings.HasPrefix(line, key) {
 			lines[i] = key + value
 			replaced = true
 			break
 		}
 	}
+	lines = compactNonEmptyLines(lines)
 	if !replaced {
 		lines = append(lines, key+value)
 	}
@@ -296,6 +294,16 @@ func rewriteEnvValue(path, name, value string) error {
 		content += "\n"
 	}
 	return writeEnvFileAtomic(path, []byte(content))
+}
+
+func compactNonEmptyLines(lines []string) []string {
+	result := lines[:0]
+	for _, line := range lines {
+		if line != "" {
+			result = append(result, line)
+		}
+	}
+	return result
 }
 
 func writeEnvFileAtomic(path string, content []byte) error {
@@ -515,6 +523,7 @@ func menuUpdate(m *menu, logger *slog.Logger) error {
 	}
 	fmt.Println(m.updateChecking())
 	if err := update.Run(logger, []string{"--repo", repo}); err != nil {
+		logger.Error("menu update failed", "error", err)
 		return fmt.Errorf("%w: %v", errUpdateFailed, err)
 	}
 	return nil
@@ -554,7 +563,6 @@ func menuUninstall(reader *bufio.Reader, m *menu) error {
 
 // menu-local sentinel errors so callers can map them to localized messages.
 var (
-	errCurrentWrong       = errors.New("menu: current password is incorrect")
 	errPasswordsDiffer    = errors.New("menu: passwords do not match")
 	errNoSystemctl        = errors.New("menu: systemctl not found")
 	errRestartFailed      = errors.New("menu: restart failed")
@@ -562,7 +570,6 @@ var (
 	errMenuConfig         = errors.New("menu: load configuration")
 	errMenuStore          = errors.New("menu: open database")
 	errMenuAuth           = errors.New("menu: auth service")
-	errMenuEnvWrite       = errors.New("menu: write env file")
 	errMenuPortWrite      = errors.New("menu: write Web port")
 	errInvalidWebPort     = errors.New("menu: invalid Web port")
 	errWebPortUnavailable = errors.New("menu: Web port unavailable")
@@ -580,17 +587,17 @@ func (m *menu) msg(key string) string {
 	table := map[string][2]string{
 		"title":               {"vocat 管理菜单", "vocat management menu"},
 		"opt_lang":            {"1) 切换中英文", "1) Toggle language"},
-		"opt_change":          {"2) 修改账号密码", "2) Change admin password"},
+		"opt_change":          {"2) 修改账号密码", "2) Change admin credentials"},
 		"opt_port":            {"3) 修改 Web 监听端口", "3) Change Web listening port"},
 		"opt_restart":         {"4) 重启软件", "4) Restart software"},
 		"opt_update":          {"5) 更新软件", "5) Update software"},
 		"opt_uninstall":       {"0) 卸载软件", "0) Uninstall software"},
 		"prompt":              {"请选择: ", "Select: "},
 		"invalid":             {"无效选项，请重试。按 Ctrl+C 退出。", "Invalid choice, try again. Press Ctrl+C to exit."},
-		"cur_pw":              {"当前密码: ", "Current password: "},
-		"new_pw":              {"新密码 (至少 12 位): ", "New password (min 12 chars): "},
+		"new_username":        {"新用户名（直接回车保留 %s）: ", "New username (Enter to keep %s): "},
+		"new_pw":              {"新密码: ", "New password: "},
 		"confirm_pw":          {"确认新密码: ", "Confirm new password: "},
-		"pw_changed":          {"密码已修改。重启后仍然有效。", "Password changed. Survives restart."},
+		"pw_changed":          {"管理员账号密码已修改，现有 Web 会话已退出。", "Administrator credentials changed; existing Web sessions were signed out."},
 		"current_web_address": {"当前 Web 监听地址: %s", "Current Web listening address: %s"},
 		"new_web_port":        {"新端口 (1-65535，直接回车取消，当前 %s): ", "New port (1-65535, Enter to cancel, current %s): "},
 		"web_port_cancelled":  {"已取消修改端口。", "Web port change cancelled."},
@@ -624,10 +631,12 @@ func (m *menu) msg(key string) string {
 	return entry[zh]
 }
 
-func (m *menu) title() string           { return m.msg("title") }
-func (m *menu) prompt() string          { return m.msg("prompt") }
-func (m *menu) invalid() string         { return m.msg("invalid") }
-func (m *menu) currentPassword() string { return m.msg("cur_pw") }
+func (m *menu) title() string   { return m.msg("title") }
+func (m *menu) prompt() string  { return m.msg("prompt") }
+func (m *menu) invalid() string { return m.msg("invalid") }
+func (m *menu) newUsername(current string) string {
+	return fmt.Sprintf(m.msg("new_username"), current)
+}
 func (m *menu) newPassword() string     { return m.msg("new_pw") }
 func (m *menu) confirmPassword() string { return m.msg("confirm_pw") }
 func (m *menu) passwordChanged() string { return m.msg("pw_changed") }
@@ -662,11 +671,6 @@ func (m *menu) options() []string {
 
 func (m *menu) errorPrefix(err error) string {
 	switch {
-	case errors.Is(err, errCurrentWrong):
-		if m.lang == "en" {
-			return "Current password is incorrect."
-		}
-		return "当前密码不正确。"
 	case errors.Is(err, errPasswordsDiffer):
 		if m.lang == "en" {
 			return "Passwords do not match."
@@ -683,10 +687,11 @@ func (m *menu) errorPrefix(err error) string {
 		}
 		return "重启失败。"
 	case errors.Is(err, errUpdateFailed):
+		detail := strings.TrimPrefix(err.Error(), errUpdateFailed.Error()+": ")
 		if m.lang == "en" {
-			return "Update failed."
+			return "Update failed: " + detail
 		}
-		return "更新失败。"
+		return "更新失败: " + detail
 	case errors.Is(err, errMenuConfig):
 		if m.lang == "en" {
 			return "Failed to load configuration."
@@ -702,11 +707,6 @@ func (m *menu) errorPrefix(err error) string {
 			return "Auth service error."
 		}
 		return "认证服务错误。"
-	case errors.Is(err, errMenuEnvWrite):
-		if m.lang == "en" {
-			return "Password changed in DB, but the env file rewrite failed — restart will revert it. Check " + menuEnvFilePath() + "."
-		}
-		return "数据库密码已修改，但环境变量文件写入失败——重启后将回滚。请检查 " + menuEnvFilePath() + "。"
 	case errors.Is(err, errInvalidWebPort):
 		if m.lang == "en" {
 			return "Invalid port. Enter a number from 1 to 65535."

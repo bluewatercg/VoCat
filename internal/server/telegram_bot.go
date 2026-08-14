@@ -850,7 +850,7 @@ func (bot *telegramBot) sendDeviceStatus(ctx context.Context, config telegramRun
 					"ICCID："+firstNonEmpty(snapshot.ICCID, "--"),
 					"IMSI："+firstNonEmpty(snapshot.IMSI, "--"),
 					"号码："+resolveTelegramPhoneNumber(associationNumber, wfcState, snapshot),
-					"原运营商："+telegramHomeCarrier(snapshot.IMSI, snapshot.SPN),
+					"原运营商："+telegramSnapshotHomeCarrier(snapshot),
 					"当前网络："+telegramCurrentNetwork(snapshot),
 					"蜂窝模式："+map[bool]string{true: "飞行模式", false: "开启"}[snapshot.FlightMode],
 				)
@@ -929,20 +929,30 @@ func usableTelegramPhoneNumber(value string) bool {
 }
 
 func telegramHomeCarrier(imsi string, spn ...string) string {
-	plmn, name, country, ok := device.CarrierForIMSI(imsi)
-	if !ok {
-		if len(spn) > 0 && strings.TrimSpace(spn[0]) != "" {
-			return strings.TrimSpace(spn[0])
-		}
+	identity := device.CarrierIdentity{IMSI: imsi}
+	if len(spn) > 0 {
+		identity.SPN = spn[0]
+	}
+	return telegramResolvedHomeCarrier(identity)
+}
+
+func telegramSnapshotHomeCarrier(snapshot *device.Snapshot) string {
+	if snapshot == nil {
 		return "--"
 	}
-	if len(spn) > 0 && strings.TrimSpace(spn[0]) != "" {
-		brand := strings.TrimSpace(spn[0])
-		brandCountry := country
-		if strings.Contains(strings.ToLower(brand), "lebara") && strings.HasPrefix(strings.TrimSpace(imsi), "20404") {
-			brandCountry = "GB"
+	return telegramResolvedHomeCarrier(device.CarrierIdentity{
+		IMSI: snapshot.IMSI, ICCID: snapshot.ICCID, SPN: snapshot.SPN,
+		GID1: snapshot.GID1, GID2: snapshot.GID2, MNCLength: snapshot.MNCLength,
+	})
+}
+
+func telegramResolvedHomeCarrier(identity device.CarrierIdentity) string {
+	plmn, name, country, ok := device.CarrierForSIM(identity)
+	if !ok {
+		if strings.TrimSpace(identity.SPN) != "" {
+			return strings.TrimSpace(identity.SPN)
 		}
-		return strings.TrimSpace(strings.Join([]string{telegramCountryFlag(brandCountry), brand, "（认证核心 " + plmn + "）"}, " "))
+		return "--"
 	}
 	return strings.TrimSpace(strings.Join([]string{telegramCountryFlag(country), name, "(" + plmn + ")"}, " "))
 }
@@ -2318,6 +2328,11 @@ func (bot *telegramBot) loadConfig(ctx context.Context) (telegramRuntimeConfig, 
 }
 
 func (bot *telegramBot) call(ctx context.Context, config telegramRuntimeConfig, method string, payload any, result any) error {
+	// Telegram polling is a long-lived notification channel and must use the
+	// same administrator-configured destination exceptions as test messages,
+	// SMS pushes and automatic-task notifications. This keeps SSRF protection
+	// enabled while allowing explicit DNS Fake-IP ranges such as 198.18/15.
+	ctx = bot.notificationDestinationContext(ctx)
 	base, err := validateTelegramAPIURL(ctx, config.BaseURL, config.Token, method)
 	if err != nil {
 		return redactTelegramError(err, config.Token)
@@ -2358,6 +2373,13 @@ func (bot *telegramBot) call(ctx context.Context, config telegramRuntimeConfig, 
 		}
 	}
 	return nil
+}
+
+func (bot *telegramBot) notificationDestinationContext(ctx context.Context) context.Context {
+	if bot.server == nil {
+		return ctx
+	}
+	return bot.server.notificationDestinationContext(ctx)
 }
 
 func (bot *telegramBot) sendText(ctx context.Context, config telegramRuntimeConfig, chatID int64, text string, replyMarkup any) error {

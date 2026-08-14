@@ -53,11 +53,14 @@ func TestRewriteEnvValuePreservesOtherSettings(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := string(content)
-	if !strings.Contains(got, "VOCAT_ADMIN_PASSWORD=secret\n") || !strings.Contains(got, "VOCAT_ADDR=0.0.0.0:8080\n") || strings.Contains(got, ":7575") {
+	if strings.Contains(got, "VOCAT_ADMIN_PASSWORD") || !strings.Contains(got, "VOCAT_ADDR=0.0.0.0:8080\n") || strings.Contains(got, ":7575") {
 		t.Fatalf("rewritten env = %q", got)
 	}
 	if err := rewriteEnvValue(path, "VOCAT_ADDR", "0.0.0.0:9000\nVOCAT_ADMIN_PASSWORD=changed"); err == nil {
 		t.Fatal("environment line injection was accepted")
+	}
+	if err := rewriteEnvValue(path, "VOCAT_ADMIN_PASSWORD", "changed-password"); err == nil {
+		t.Fatal("administrator credential was accepted for the environment file")
 	}
 }
 
@@ -66,6 +69,23 @@ func TestMenuIncludesWebPortOptionInBothLanguages(t *testing.T) {
 		options := strings.Join(newMenu(lang).options(), "\n")
 		if !strings.Contains(options, "3)") || !strings.Contains(strings.ToLower(options), "web") {
 			t.Fatalf("%s menu options do not contain Web port entry: %q", lang, options)
+		}
+	}
+}
+
+func TestMenuCredentialResetPromptsDoNotRequestCurrentPassword(t *testing.T) {
+	for _, lang := range []string{"zh", "en"} {
+		menu := newMenu(lang)
+		prompts := strings.Join([]string{
+			menu.newUsername("admin"),
+			menu.newPassword(),
+			menu.confirmPassword(),
+		}, "\n")
+		if strings.Contains(strings.ToLower(prompts), "current password") || strings.Contains(prompts, "当前密码") {
+			t.Fatalf("%s credential reset still requests the current password: %q", lang, prompts)
+		}
+		if !strings.Contains(prompts, "admin") {
+			t.Fatalf("%s username prompt does not show the current username: %q", lang, prompts)
 		}
 	}
 }

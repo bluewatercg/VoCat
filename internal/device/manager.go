@@ -25,6 +25,7 @@ type Options struct {
 
 type Manager struct {
 	mu             sync.RWMutex
+	uiccMu         sync.Mutex // serializes all multi-command UICC/APDU transactions
 	esimMu         sync.Mutex // serializes eSIM card access (list/switch/download)
 	esimRecoveryMu sync.Mutex
 	esimRecoveries map[string]chan struct{}
@@ -40,6 +41,23 @@ type Manager struct {
 	started        bool
 	devices        map[string]*managedDevice
 	ussdSessions   map[string]ussdSession
+}
+
+// LockUICC and UnlockUICC allow another in-process UICC client (currently the
+// VoWiFi AKA adapter) to share the same transaction boundary as eSIM ES10.
+// Individual AT commands are already serialized per modem, but a logical-
+// channel transaction spans several commands and must not be interleaved.
+func (manager *Manager) LockUICC()   { manager.uiccMu.Lock() }
+func (manager *Manager) UnlockUICC() { manager.uiccMu.Unlock() }
+
+func (manager *Manager) lockESIM() {
+	manager.esimMu.Lock()
+	manager.uiccMu.Lock()
+}
+
+func (manager *Manager) unlockESIM() {
+	manager.uiccMu.Unlock()
+	manager.esimMu.Unlock()
 }
 
 // ussdSession tracks an open USSD dialog on a device so a follow-up Continue or
@@ -163,6 +181,7 @@ func (manager *Manager) Discover(ctx context.Context) ([]Device, error) {
 				ReaderName: reader.Name, USBPath: reader.USBPath,
 				VendorID: reader.VendorID, ProductID: reader.ProductID,
 				Manufacturer: reader.Manufacturer, Product: reader.Product,
+				DiscoveryIssue: reader.DiscoveryIssue,
 			})
 		}
 	}
@@ -392,7 +411,14 @@ func (manager *Manager) Refresh(ctx context.Context, id string) (Snapshot, error
 		return Snapshot{}, err
 	}
 	previousICCID := state.lastICCID
-	snapshot, err := manager.readSnapshot(ctx, id, candidate, backend, previousICCID, client)
+	var previousSnapshot *Snapshot
+	manager.mu.RLock()
+	if state.snapshot != nil {
+		copy := *state.snapshot
+		previousSnapshot = &copy
+	}
+	manager.mu.RUnlock()
+	snapshot, err := manager.readSnapshot(ctx, id, candidate, backend, previousICCID, previousSnapshot, client)
 	if err == nil && strings.TrimSpace(snapshot.ICCID) != "" {
 		state.lastICCID = strings.TrimSpace(snapshot.ICCID)
 	}
@@ -428,6 +454,7 @@ func (manager *Manager) refreshCardReader(ctx context.Context, id string, state 
 		result.ICCID = card.Identity.ICCID
 		result.IMSI = card.Identity.IMSI
 		result.SPN = card.Identity.SPN
+		result.MNCLength = card.Identity.MNCLength
 		result.SIMChanged = previousICCID != "" && !strings.EqualFold(previousICCID, result.ICCID)
 		state.lastICCID = result.ICCID
 	}
